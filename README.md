@@ -275,11 +275,27 @@ cd client && npm test
 ## 📦 Production Deployment
 
 ### Environment Setup
-1. **Set production environment variables**
-2. **Use MongoDB Atlas** for cloud database
-3. **Configure CORS** for your domain
+1. **Set production environment variables** (see `.env.example`)
+   ```env
+   NODE_ENV=production
+   PORT=5000
+   MONGODB_URI=mongodb://gamificat01_db_user:DdlxMFg7gbt5sKdO@ac-y5mkqbh-shard-00-00.ekcm26f.mongodb.net:27017,ac-y5mkqbh-shard-00-01.ekcm26f.mongodb.net:27017,ac-y5mkqbh-shard-00-02.ekcm26f.mongodb.net:27017/?replicaSet=atlas-27ya7b-shard-0&ssl=true&authSource=admin
+   JWT_SECRET=replace_with_strong_secret
+   ALLOWED_ORIGINS=https://finance-beige-nine.vercel.app
+   ```
+   *Set `ALLOWED_ORIGINS` to a comma-separated list of all front-end URLs that should be able to call the API/Socket server.*
+2. **Use MongoDB Atlas** for cloud database (URI above already points to the managed cluster)
+3. **Configure CORS** using `ALLOWED_ORIGINS` so Vercel/other deploys can reach the API
 4. **Set up SSL/HTTPS** certificates
 5. **Use PM2** for process management
+
+### Front-end Environment (Vite / Vercel)
+Create `client/.env` (or configure Vercel project env variables):
+```
+VITE_API_BASE_URL=https://your-backend-domain.com/api
+VITE_SOCKET_URL=wss://your-backend-domain.com
+```
+For the current deployment these can point to the same domain that hosts the Express server. The Vercel-hosted UI at `https://finance-beige-nine.vercel.app` must include these values so all API calls and Socket.IO connections go to the production backend.
 
 ### Build for Production
 ```bash

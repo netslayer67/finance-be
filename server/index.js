@@ -21,10 +21,24 @@ import connectDB from './config/database.js';
 dotenv.config();
 
 const app = express();
+
+const defaultDevOrigins = ['http://localhost:5173', 'http://localhost:3000'];
+const parseAllowedOrigins = () => {
+    if (process.env.ALLOWED_ORIGINS) {
+        return process.env.ALLOWED_ORIGINS
+            .split(',')
+            .map(origin => origin.trim())
+            .filter(Boolean);
+    }
+    return process.env.NODE_ENV === 'production' ? [] : defaultDevOrigins;
+};
+
+const allowedOrigins = parseAllowedOrigins();
+
 const server = createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: process.env.NODE_ENV === 'production' ? false : ['http://localhost:5173'],
+        origin: allowedOrigins.length ? allowedOrigins : defaultDevOrigins,
         methods: ['GET', 'POST']
     }
 });
@@ -44,7 +58,7 @@ app.use('/api/', limiter);
 
 // CORS configuration
 app.use(cors({
-    origin: process.env.NODE_ENV === 'production' ? false : ['http://localhost:5173', 'http://localhost:3000'],
+    origin: allowedOrigins.length ? allowedOrigins : defaultDevOrigins,
     credentials: true
 }));
 

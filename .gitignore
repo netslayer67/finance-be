@@ -11,6 +11,7 @@ yarn.lock
 # Env & secrets
 .env
 .env.*
+!.env.example
 
 # Logs & coverage
 logs/

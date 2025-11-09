@@ -1,0 +1,41 @@
+# Node / general
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# Env & secrets
+.env
+.env.*
+
+# Logs & coverage
+logs/
+*.log
+*.pid
+coverage/
+.nyc_output/
+
+# Build outputs
+dist/
+build/
+tmp/
+temp/
+
+# Uploads / generated files
+uploads/
+
+# IDE / OS specific
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Client kept in separate repo
+client/
+
+# Server build artifacts
+server/node_modules/

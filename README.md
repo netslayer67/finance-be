@@ -285,7 +285,7 @@ cd client && npm test
    PORT=5000
    MONGODB_URI=mongodb://gamificat01_db_user:DdlxMFg7gbt5sKdO@ac-y5mkqbh-shard-00-00.ekcm26f.mongodb.net:27017,ac-y5mkqbh-shard-00-01.ekcm26f.mongodb.net:27017,ac-y5mkqbh-shard-00-02.ekcm26f.mongodb.net:27017/?replicaSet=atlas-27ya7b-shard-0&ssl=true&authSource=admin
    JWT_SECRET=replace_with_strong_secret
-   ALLOWED_ORIGINS=https://finance-beige-nine.vercel.app
+   ALLOWED_ORIGINS=http://localhost:5173,https://finance-beige-nine.vercel.app,https://finance-be-production-52fb.up.railway.app
    ```
    *Set `ALLOWED_ORIGINS` to a comma-separated list of all front-end URLs that should be able to call the API/Socket server.*
 2. **Use MongoDB Atlas** for cloud database (URI above already points to the managed cluster)
@@ -299,7 +299,12 @@ Create `client/.env` (or configure Vercel project env variables):
 VITE_API_BASE_URL=https://your-backend-domain.com/api
 VITE_SOCKET_URL=wss://your-backend-domain.com
 ```
-For the current deployment these can point to the same domain that hosts the Express server. The Vercel-hosted UI at `https://finance-beige-nine.vercel.app` must include these values so all API calls and Socket.IO connections go to the production backend.
+For the current deployment these should point to the Railway backend (`https://finance-be-production-52fb.up.railway.app`). The Vercel-hosted UI at `https://finance-beige-nine.vercel.app` must declare:
+```
+VITE_API_BASE_URL=https://finance-be-production-52fb.up.railway.app/api
+VITE_SOCKET_URL=wss://finance-be-production-52fb.up.railway.app
+```
+so every API/SSE call is routed to the live backend.
 
 ### Build for Production
 ```bash

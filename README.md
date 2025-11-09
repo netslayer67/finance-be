@@ -105,8 +105,9 @@ financial-dashboard-system/
    ```env
    NODE_ENV=development
    PORT=5000
-   MONGODB_URI=mongodb://localhost:27017/financial_dashboard
+   MONGODB_URI=mongodb://gamificat01_db_user:DdlxMFg7gbt5sKdO@ac-y5mkqbh-shard-00-00.ekcm26f.mongodb.net:27017,ac-y5mkqbh-shard-00-01.ekcm26f.mongodb.net:27017,ac-y5mkqbh-shard-00-02.ekcm26f.mongodb.net:27017/?replicaSet=atlas-27ya7b-shard-0&ssl=true&authSource=admin
    JWT_SECRET=your_jwt_secret_here
+   ALLOWED_ORIGINS=http://localhost:5173
    ```
 
 4. **Start MongoDB**
@@ -118,17 +119,20 @@ financial-dashboard-system/
    docker run -d -p 27017:27017 --name mongodb mongo:latest
    ```
 
-5. **Start the application**
+5. **Start the backend API**
    ```bash
-   # Development mode (runs both server and client)
+   # Development mode (backend only)
    npm run dev
    
-   # Or start separately
-   # Terminal 1 - Server
-   npm run server
-   
-   # Terminal 2 - Client
-   npm run client
+   # Production mode
+   npm start
+   ```
+
+   **Start the frontend locally**
+   ```bash
+   cd client
+   npm install   # first run only
+   npm run dev
    ```
 
 6. **Access the application**

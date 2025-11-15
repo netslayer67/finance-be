@@ -1,14 +1,52 @@
 import express from 'express';
 import { query, validationResult } from 'express-validator';
+import ExcelJS from 'exceljs';
 import FinancialRecord from '../models/FinancialRecord.js';
 
 const router = express.Router();
+
+const NUMERIC_FORMAT = '#,##0.00';
+const AVAILABLE_ORGANIZATIONS = ['IQRA', 'ICBM'];
+const AVAILABLE_ACCOUNTS = ['Ecobank', 'NBS Bank'];
+
+const formatExpenseLabel = (value = '') => {
+    const withSpaces = value
+        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+        .replace(/_/g, ' ')
+        .trim();
+
+    return withSpaces
+        .split(' ')
+        .filter(Boolean)
+        .map((word) => {
+            if (word.length <= 3 || /^[A-Z]+$/.test(word)) {
+                return word.toUpperCase();
+            }
+            return word.charAt(0).toUpperCase() + word.slice(1);
+        })
+        .join(' ');
+};
+
+const expenseSchema = FinancialRecord.schema.path('expenses');
+const expensePaths = expenseSchema?.schema?.paths || {};
+const EXPENSE_CATEGORIES = Object.keys(expensePaths)
+    .filter((field) => field !== 'totalExpenses')
+    .map((field) => ({
+        key: field,
+        label: formatExpenseLabel(field)
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+const EXPENSE_CATEGORY_SET = new Set(EXPENSE_CATEGORIES.map((category) => category.key));
+const EXPENSE_CATEGORY_LABEL_MAP = EXPENSE_CATEGORIES.reduce((acc, category) => {
+    acc[category.key] = category.label;
+    return acc;
+}, {});
 
 // Get consolidated financial report
 router.get('/consolidated', [
     query('startDate').optional().isISO8601(),
     query('endDate').optional().isISO8601(),
-    query('organization').optional().isIn(['IQRA', 'ICBM']),
+    query('organization').optional().isIn(AVAILABLE_ORGANIZATIONS),
     query('format').optional().isIn(['json', 'excel'])
 ], async (req, res) => {
     try {
@@ -48,15 +86,16 @@ router.get('/consolidated', [
         const consolidationResult = consolidateFinancialData(records);
 
         if (format === 'excel') {
-            // Return Excel format (you would implement Excel generation here)
-            res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-            res.setHeader('Content-Disposition', 'attachment; filename=consolidated-report.xlsx');
-            // Return Excel data
-            return res.json({
-                success: true,
-                message: 'Excel format not implemented yet',
-                data: consolidationResult
+            const workbook = createConsolidatedWorkbook(consolidationResult, {
+                startDate,
+                endDate,
+                organization
             });
+
+            res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+            res.setHeader('Content-Disposition', `attachment; filename=consolidated-report-${Date.now()}.xlsx`);
+            await workbook.xlsx.write(res);
+            return res.end();
         }
 
         res.json({
@@ -80,7 +119,7 @@ router.get('/comparative', [
     query('period1End').notEmpty().isISO8601(),
     query('period2Start').notEmpty().isISO8601(),
     query('period2End').notEmpty().isISO8601(),
-    query('organization').optional().isIn(['IQRA', 'ICBM'])
+    query('organization').optional().isIn(AVAILABLE_ORGANIZATIONS)
 ], async (req, res) => {
     try {
         const errors = validationResult(req);
@@ -137,10 +176,208 @@ router.get('/comparative', [
     }
 });
 
+router.get('/expenses/categories', (req, res) => {
+    res.json({
+        success: true,
+        data: {
+            categories: EXPENSE_CATEGORIES
+        }
+    });
+});
+
+router.get('/expenses/breakdown', [
+    query('startDate').notEmpty().isISO8601(),
+    query('endDate').notEmpty().isISO8601(),
+    query('organization').optional().isIn(AVAILABLE_ORGANIZATIONS),
+    query('account').optional().isIn(AVAILABLE_ACCOUNTS),
+    query('categories').optional().custom((value) => {
+        if (!value) return true;
+        const requested = value.split(',').map((item) => item.trim()).filter(Boolean);
+        const invalid = requested.filter((category) => !EXPENSE_CATEGORY_SET.has(category));
+        if (invalid.length) {
+            throw new Error(`Invalid categories requested: ${invalid.join(', ')}`);
+        }
+        return true;
+    }),
+    query('format').optional().isIn(['json', 'excel'])
+], async (req, res) => {
+    try {
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) {
+            return res.status(400).json({
+                success: false,
+                message: 'Validation failed',
+                errors: errors.array()
+            });
+        }
+
+        const {
+            startDate,
+            endDate,
+            organization,
+            account,
+            categories,
+            format = 'json'
+        } = req.query;
+
+        const start = normaliseDate(startDate);
+        const end = normaliseDate(endDate, true);
+
+        if (!start || !end || start > end) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid date range supplied'
+            });
+        }
+
+        let selectedCategories = categories
+            ? categories.split(',').map((item) => item.trim()).filter(Boolean)
+            : EXPENSE_CATEGORIES.map(({ key }) => key);
+
+        selectedCategories = Array.from(new Set(selectedCategories));
+
+        if (!selectedCategories.length) {
+            selectedCategories = EXPENSE_CATEGORIES.map(({ key }) => key);
+        }
+
+        const invalidCategories = selectedCategories.filter((category) => !EXPENSE_CATEGORY_SET.has(category));
+        if (invalidCategories.length) {
+            return res.status(400).json({
+                success: false,
+                message: `Invalid categories requested: ${invalidCategories.join(', ')}`
+            });
+        }
+
+        const matchStage = {
+            periodStart: {
+                $gte: start,
+                $lte: end
+            }
+        };
+
+        if (organization) matchStage.organization = organization.toUpperCase();
+        if (account) matchStage.account = account;
+
+        const totalsAggregation = await FinancialRecord.aggregate([
+            { $match: matchStage },
+            {
+                $group: {
+                    _id: null,
+                    totalRecords: { $sum: 1 },
+                    totalExpenses: { $sum: '$expenses.totalExpenses' },
+                    ...buildExpenseAggregation(selectedCategories)
+                }
+            }
+        ]);
+
+        if (!totalsAggregation.length) {
+            return res.status(404).json({
+                success: false,
+                message: 'No financial records found for the specified criteria'
+            });
+        }
+
+        const monthlyAggregation = await FinancialRecord.aggregate([
+            { $match: matchStage },
+            {
+                $group: {
+                    _id: {
+                        year: '$year',
+                        month: '$month',
+                        monthIndex: '$monthIndex'
+                    },
+                    totalExpenses: { $sum: '$expenses.totalExpenses' },
+                    ...buildExpenseAggregation(selectedCategories)
+                }
+            },
+            { $sort: { '_id.year': 1, '_id.monthIndex': 1 } }
+        ]);
+
+        const totals = totalsAggregation[0];
+
+        const breakdown = selectedCategories.map((category) => {
+            const label = getExpenseCategoryLabel(category);
+            const total = totals[category] || 0;
+            return {
+                key: category,
+                label,
+                total,
+                percentage: totals.totalExpenses ? (total / totals.totalExpenses) * 100 : 0,
+                monthly: monthlyAggregation.map((month) => ({
+                    period: `${month._id.month} ${month._id.year}`,
+                    year: month._id.year,
+                    month: month._id.month,
+                    monthIndex: month._id.monthIndex,
+                    value: month[category] || 0
+                }))
+            };
+        });
+
+        const monthlyTotals = monthlyAggregation.map((month) => ({
+            period: `${month._id.month} ${month._id.year}`,
+            year: month._id.year,
+            monthIndex: month._id.monthIndex,
+            total: month.totalExpenses || 0,
+            categories: selectedCategories.reduce((acc, category) => {
+                acc[category] = month[category] || 0;
+                return acc;
+            }, {})
+        }));
+
+        const filtersDescription = formatFiltersDescription({
+            organization,
+            account,
+            startDate,
+            endDate
+        });
+
+        const payload = {
+            summary: {
+                totalExpenses: totals.totalExpenses || 0,
+                totalRecords: totals.totalRecords || 0,
+                range: {
+                    start: startDate,
+                    end: endDate,
+                    label: formatDateRangeLabel(startDate, endDate)
+                },
+                filters: {
+                    organization: organization || 'All',
+                    account: account || 'All',
+                    description: filtersDescription
+                }
+            },
+            breakdown,
+            monthlyTotals,
+            selectedCategories,
+            filterDescription: filtersDescription
+        };
+
+        if (format === 'excel') {
+            const workbook = createExpenseBreakdownWorkbook(payload);
+            res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+            res.setHeader('Content-Disposition', `attachment; filename=expense-breakdown-${Date.now()}.xlsx`);
+            await workbook.xlsx.write(res);
+            return res.end();
+        }
+
+        res.json({
+            success: true,
+            data: payload
+        });
+    } catch (error) {
+        console.error('Error generating expense breakdown:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error generating expense breakdown',
+            error: error.message
+        });
+    }
+});
+
 // Get organization-wise summary
 router.get('/organization-summary', [
     query('year').optional().isInt({ min: 2020, max: 2030 }),
-    query('organization').optional().isIn(['IQRA', 'ICBM'])
+    query('organization').optional().isIn(AVAILABLE_ORGANIZATIONS)
 ], async (req, res) => {
     try {
         const { year, organization } = req.query;
@@ -227,7 +464,8 @@ const consolidateFinancialData = (records) => {
                 totalExpenses: 0,
                 netIncome: 0,
                 recordsCount: 0,
-                monthIndex
+                monthIndex,
+                year
             };
         }
         result.byMonth[monthKey].totalIncome += record.income?.totalIncome || 0;
@@ -315,6 +553,258 @@ const calculatePercentageChanges = (period1, period2) => {
         netIncome: period1.netIncome !== 0 ? ((period2.netIncome - period1.netIncome) / period1.netIncome) * 100 : 0,
         avgClosingBalance: period1.avgClosingBalance !== 0 ? ((period2.avgClosingBalance - period1.avgClosingBalance) / period1.avgClosingBalance) * 100 : 0
     };
+};
+
+const buildExpenseAggregation = (categories = []) => {
+    return categories.reduce((acc, category) => {
+        acc[category] = { $sum: { $ifNull: [`$expenses.${category}`, 0] } };
+        return acc;
+    }, {});
+};
+
+const getExpenseCategoryLabel = (category) => {
+    return EXPENSE_CATEGORY_LABEL_MAP[category] || formatExpenseLabel(category);
+};
+
+const normaliseDate = (value, isEnd = false) => {
+    if (!value) return null;
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+        return null;
+    }
+
+    if (isEnd) {
+        date.setHours(23, 59, 59, 999);
+    } else {
+        date.setHours(0, 0, 0, 0);
+    }
+
+    return date;
+};
+
+const formatDateRangeLabel = (start, end) => {
+    const parsedStart = start ? new Date(start) : null;
+    const parsedEnd = end ? new Date(end) : null;
+
+    const hasValidStart = parsedStart && !Number.isNaN(parsedStart.getTime());
+    const hasValidEnd = parsedEnd && !Number.isNaN(parsedEnd.getTime());
+
+    if (!hasValidStart && !hasValidEnd) return 'All records';
+
+    const formatter = new Intl.DateTimeFormat('en-GB', {
+        day: '2-digit',
+        month: 'short',
+        year: 'numeric'
+    });
+
+    if (hasValidStart && hasValidEnd) {
+        return `${formatter.format(parsedStart)} - ${formatter.format(parsedEnd)}`;
+    }
+
+    if (hasValidStart) {
+        return `From ${formatter.format(parsedStart)}`;
+    }
+
+    return `Until ${formatter.format(parsedEnd)}`;
+};
+
+const formatFiltersDescription = ({
+    organization,
+    account,
+    startDate,
+    endDate
+} = {}) => {
+    const parts = [];
+
+    if (organization) parts.push(`Organization: ${organization}`);
+    if (account) parts.push(`Account: ${account}`);
+    if (startDate || endDate) {
+        parts.push(`Range: ${formatDateRangeLabel(startDate, endDate)}`);
+    }
+
+    if (!parts.length) {
+        return 'All records';
+    }
+
+    return parts.join(' | ');
+};
+
+const createConsolidatedWorkbook = (data, filters = {}) => {
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = 'Financial Dashboard';
+    workbook.created = new Date();
+
+    const summarySheet = workbook.addWorksheet('Summary');
+    summarySheet.mergeCells('A1:B1');
+    summarySheet.getCell('A1').value = 'Financial Consolidated Report';
+    summarySheet.getCell('A1').font = { bold: true, size: 16 };
+    summarySheet.getCell('A1').alignment = { horizontal: 'center' };
+
+    summarySheet.addRow([]);
+
+    summarySheet.addRow(['Generated', new Date().toLocaleString()]);
+    summarySheet.addRow(['Filters', formatFiltersDescription(filters)]);
+    summarySheet.addRow(['Period', formatDateRangeLabel(filters.startDate, filters.endDate)]);
+    summarySheet.addRow(['Total Records', data.summary.recordCount]);
+
+    const addCurrencyRow = (label, amount) => {
+        const row = summarySheet.addRow([label, amount]);
+        row.getCell(2).numFmt = NUMERIC_FORMAT;
+    };
+
+    addCurrencyRow('Total Income', data.summary.totalIncome);
+    addCurrencyRow('Total Expenses', data.summary.totalExpenses);
+    addCurrencyRow('Net Income', data.summary.netIncome);
+
+    summarySheet.getColumn(1).width = 25;
+    summarySheet.getColumn(2).width = 20;
+
+    const organizationSheet = workbook.addWorksheet('By Organization');
+    organizationSheet.columns = [
+        { header: 'Organization', key: 'organization', width: 18 },
+        { header: 'Total Income', key: 'totalIncome', width: 18, style: { numFmt: NUMERIC_FORMAT } },
+        { header: 'Total Expenses', key: 'totalExpenses', width: 18, style: { numFmt: NUMERIC_FORMAT } },
+        { header: 'Net Income', key: 'netIncome', width: 18, style: { numFmt: NUMERIC_FORMAT } },
+        { header: 'Records', key: 'recordsCount', width: 12 }
+    ];
+
+    Object.entries(data.byOrganization).forEach(([organization, stats]) => {
+        organizationSheet.addRow({
+            organization,
+            totalIncome: stats.totalIncome,
+            totalExpenses: stats.totalExpenses,
+            netIncome: stats.netIncome,
+            recordsCount: stats.recordsCount
+        });
+    });
+
+    const monthSheet = workbook.addWorksheet('By Month');
+    monthSheet.columns = [
+        { header: 'Period', key: 'period', width: 18 },
+        { header: 'Total Income', key: 'totalIncome', width: 18, style: { numFmt: NUMERIC_FORMAT } },
+        { header: 'Total Expenses', key: 'totalExpenses', width: 18, style: { numFmt: NUMERIC_FORMAT } },
+        { header: 'Net Income', key: 'netIncome', width: 18, style: { numFmt: NUMERIC_FORMAT } },
+        { header: 'Records', key: 'recordsCount', width: 12 }
+    ];
+
+    Object.entries(data.byMonth)
+        .sort(([, a], [, b]) => {
+            const yearDiff = (a.year || 0) - (b.year || 0);
+            if (yearDiff !== 0) return yearDiff;
+            return (a.monthIndex || 0) - (b.monthIndex || 0);
+        })
+        .forEach(([period, stats]) => {
+            monthSheet.addRow({
+                period,
+                totalIncome: stats.totalIncome,
+                totalExpenses: stats.totalExpenses,
+                netIncome: stats.netIncome,
+                recordsCount: stats.recordsCount || 0
+            });
+        });
+
+    const accountSheet = workbook.addWorksheet('By Account');
+    accountSheet.columns = [
+        { header: 'Account', key: 'account', width: 18 },
+        { header: 'Total Income', key: 'totalIncome', width: 18, style: { numFmt: NUMERIC_FORMAT } },
+        { header: 'Total Expenses', key: 'totalExpenses', width: 18, style: { numFmt: NUMERIC_FORMAT } },
+        { header: 'Net Income', key: 'netIncome', width: 18, style: { numFmt: NUMERIC_FORMAT } },
+        { header: 'Records', key: 'recordsCount', width: 12 }
+    ];
+
+    Object.entries(data.byAccount).forEach(([account, stats]) => {
+        accountSheet.addRow({
+            account,
+            totalIncome: stats.totalIncome,
+            totalExpenses: stats.totalExpenses,
+            netIncome: stats.netIncome,
+            recordsCount: stats.recordsCount
+        });
+    });
+
+    const detailSheet = workbook.addWorksheet('Detailed Records');
+    detailSheet.columns = [
+        { header: 'Organization', key: 'organization', width: 15 },
+        { header: 'Period', key: 'period', width: 15 },
+        { header: 'Account', key: 'account', width: 15 },
+        { header: 'Income', key: 'income', width: 15, style: { numFmt: NUMERIC_FORMAT } },
+        { header: 'Expenses', key: 'expenses', width: 15, style: { numFmt: NUMERIC_FORMAT } },
+        { header: 'Net Income', key: 'netIncome', width: 15, style: { numFmt: NUMERIC_FORMAT } },
+        { header: 'Closing Balance', key: 'closingBalance', width: 18, style: { numFmt: NUMERIC_FORMAT } }
+    ];
+
+    data.records.forEach((record) => {
+        detailSheet.addRow({
+            organization: record.organization,
+            period: `${record.month} ${record.year}`,
+            account: record.account,
+            income: record.income?.totalIncome || 0,
+            expenses: record.expenses?.totalExpenses || 0,
+            netIncome: record.netIncome || 0,
+            closingBalance: record.closingBalance || 0
+        });
+    });
+
+    return workbook;
+};
+
+const createExpenseBreakdownWorkbook = (data) => {
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = 'Financial Dashboard';
+    workbook.created = new Date();
+
+    const summarySheet = workbook.addWorksheet('Expense Summary');
+    summarySheet.mergeCells('A1:C1');
+    summarySheet.getCell('A1').value = 'Expense Breakdown Report';
+    summarySheet.getCell('A1').font = { bold: true, size: 16 };
+    summarySheet.getCell('A1').alignment = { horizontal: 'center' };
+
+    summarySheet.addRow([]);
+    summarySheet.addRow(['Range', data.summary.range?.label || 'All records']);
+    summarySheet.addRow(['Filters', data.filterDescription || 'All records']);
+    const totalRow = summarySheet.addRow(['Total Expenses', data.summary.totalExpenses]);
+    totalRow.getCell(2).numFmt = NUMERIC_FORMAT;
+    summarySheet.addRow(['Records', data.summary.totalRecords]);
+
+    const categorySheet = workbook.addWorksheet('Categories');
+    categorySheet.columns = [
+        { header: 'Category', key: 'category', width: 30 },
+        { header: 'Amount', key: 'amount', width: 18, style: { numFmt: NUMERIC_FORMAT } },
+        { header: 'Share (%)', key: 'percentage', width: 15, style: { numFmt: '0.00' } }
+    ];
+
+    data.breakdown.forEach((category) => {
+        categorySheet.addRow({
+            category: category.label,
+            amount: category.total,
+            percentage: category.percentage
+        });
+    });
+
+    const monthlySheet = workbook.addWorksheet('Monthly Detail');
+    const baseColumns = [
+        { header: 'Period', key: 'period', width: 18 },
+        { header: 'Total Expenses', key: 'total', width: 18, style: { numFmt: NUMERIC_FORMAT } }
+    ];
+
+    const categoryColumns = data.selectedCategories.map((categoryKey) => ({
+        header: getExpenseCategoryLabel(categoryKey),
+        key: categoryKey,
+        width: 18,
+        style: { numFmt: NUMERIC_FORMAT }
+    }));
+
+    monthlySheet.columns = [...baseColumns, ...categoryColumns];
+
+    data.monthlyTotals.forEach((month) => {
+        monthlySheet.addRow({
+            period: month.period,
+            total: month.total,
+            ...month.categories
+        });
+    });
+
+    return workbook;
 };
 
 export default router;
